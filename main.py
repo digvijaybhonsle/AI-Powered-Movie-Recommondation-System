@@ -1,6 +1,7 @@
 import os
 import pickle
 from typing import Optional, List, Dict, Any, Tuple
+from contextlib import asynccontextmanager
 
 import numpy as np
 import pandas as pd
@@ -23,23 +24,6 @@ if not OMDB_API_KEY:
 
 OMDB_BASE = "http://www.omdbapi.com/"
 
-
-# =========================
-# FASTAPI
-# =========================
-app = FastAPI(
-    title="Movie Recommendation API",
-    version="2.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # =========================
 # FILE PATHS
 # =========================
@@ -57,9 +41,31 @@ df: Optional[pd.DataFrame] = None
 indices_obj: Any = None
 tfidf_matrix: Any = None
 tfidf_obj: Any = None
-
 TITLE_TO_IDX: Optional[Dict[str, int]] = None
 
+# =========================
+# FASTAPI APP + LIFESPAN
+# =========================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await load_pickles_async()
+    yield
+    # Cleanup code can be added here later if needed
+
+
+app = FastAPI(
+    title="Movie Recommendation API",
+    version="2.0",
+    lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # =========================
 # MODELS
@@ -105,14 +111,12 @@ def _norm_title(t: str) -> str:
 # OMDB FUNCTIONS
 # =========================
 async def omdb_get(params: Dict[str, Any]) -> Dict[str, Any]:
-
     q = dict(params)
     q["apikey"] = OMDB_API_KEY
 
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(OMDB_BASE, params=q)
-
     except httpx.RequestError as e:
         raise HTTPException(
             status_code=502,
@@ -129,26 +133,16 @@ async def omdb_get(params: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def omdb_search_movie(title: str):
-
-    data = await omdb_get({
-        "t": title
-    })
-
+    data = await omdb_get({"t": title})
     if data.get("Response") == "False":
         return None
-
     return data
 
 
 async def omdb_movie_details(title: str) -> OMDBMovieDetail:
-
     data = await omdb_search_movie(title)
-
     if not data:
-        raise HTTPException(
-            status_code=404,
-            detail="Movie not found"
-        )
+        raise HTTPException(status_code=404, detail="Movie not found")
 
     return OMDBMovieDetail(
         imdb_id=data.get("imdbID"),
@@ -162,13 +156,10 @@ async def omdb_movie_details(title: str) -> OMDBMovieDetail:
 
 
 async def attach_omdb_card_by_title(title: str):
-
     try:
         data = await omdb_search_movie(title)
-
         if not data:
             return None
-
         return OMDBMovieCard(
             imdb_id=data.get("imdbID"),
             title=data.get("Title"),
@@ -176,7 +167,6 @@ async def attach_omdb_card_by_title(title: str):
             release_year=data.get("Year"),
             imdb_rating=data.get("imdbRating")
         )
-
     except Exception:
         return None
 
@@ -185,126 +175,94 @@ async def attach_omdb_card_by_title(title: str):
 # TF-IDF HELPERS
 # =========================
 def build_title_to_idx_map(indices: Any) -> Dict[str, int]:
-
     title_to_idx: Dict[str, int] = {}
 
-    if isinstance(indices, dict):
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-
-        return title_to_idx
-
     try:
-        for k, v in indices.items():
-            title_to_idx[_norm_title(k)] = int(v)
-
+        if isinstance(indices, dict):
+            for k, v in indices.items():
+                title_to_idx[_norm_title(k)] = int(v)
+        else:
+            for k, v in indices.items():
+                title_to_idx[_norm_title(k)] = int(v)
         return title_to_idx
-
     except Exception:
-        raise RuntimeError(
-            "indices.pkl must be dict or pandas Series-like"
-        )
+        raise RuntimeError("indices.pkl must be dict or pandas Series-like")
 
 
 def get_local_idx_by_title(title: str) -> int:
-
     global TITLE_TO_IDX
-
     if TITLE_TO_IDX is None:
-        raise HTTPException(
-            status_code=500,
-            detail="TF-IDF index map not initialized"
-        )
+        raise HTTPException(status_code=500, detail="TF-IDF index map not initialized")
 
     key = _norm_title(title)
-
     if key in TITLE_TO_IDX:
         return int(TITLE_TO_IDX[key])
 
-    raise HTTPException(
-        status_code=404,
-        detail=f"Title not found in local dataset: '{title}'"
-    )
+    raise HTTPException(status_code=404, detail=f"Title not found: '{title}'")
 
 
-def tfidf_recommend_titles(
-    query_title: str,
-    top_n: int = 10
-) -> List[Tuple[str, float]]:
-
+def tfidf_recommend_titles(query_title: str, top_n: int = 10) -> List[Tuple[str, float]]:
     global df, tfidf_matrix
-
     if df is None or tfidf_matrix is None:
-        raise HTTPException(
-            status_code=500,
-            detail="TF-IDF resources not loaded"
-        )
+        raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
 
     idx = get_local_idx_by_title(query_title)
-
     qv = tfidf_matrix[idx]
-
     scores = (tfidf_matrix @ qv.T).toarray().ravel()
-
     order = np.argsort(-scores)
 
     out: List[Tuple[str, float]] = []
-
     for i in order:
-
         if int(i) == int(idx):
             continue
-
         try:
             title_i = str(df.iloc[int(i)]["title"])
-
+            out.append((title_i, float(scores[int(i)])))
+            if len(out) >= top_n:
+                break
         except Exception:
             continue
-
-        out.append((title_i, float(scores[int(i)])))
-
-        if len(out) >= top_n:
-            break
-
     return out
 
 
 # =========================
-# STARTUP
+# LOAD PICKLES (Improved)
 # =========================
-@app.on_event("startup")
-def load_pickles():
+async def load_pickles_async():
+    global df, indices_obj, tfidf_matrix, tfidf_obj, TITLE_TO_IDX
 
-    global df
-    global indices_obj
-    global tfidf_matrix
-    global tfidf_obj
-    global TITLE_TO_IDX
+    print("=== Loading Pickle Files ===")
+    print(f"Current directory: {os.getcwd()}")
+    print(f"BASE_DIR: {BASE_DIR}")
 
-    # Load dataframe
-    with open(DF_PATH, "rb") as f:
-        df = pickle.load(f)
+    try:
+        with open(DF_PATH, "rb") as f:
+            df = pickle.load(f)
+        print(f"✓ df.pkl loaded | Shape: {df.shape}")
 
-    # Load indices
-    with open(INDICES_PATH, "rb") as f:
-        indices_obj = pickle.load(f)
+        with open(INDICES_PATH, "rb") as f:
+            indices_obj = pickle.load(f)
+        print("✓ indices.pkl loaded")
 
-    # Load tfidf matrix
-    with open(TFIDF_MATRIX_PATH, "rb") as f:
-        tfidf_matrix = pickle.load(f)
+        with open(TFIDF_MATRIX_PATH, "rb") as f:
+            tfidf_matrix = pickle.load(f)
+        print(f"✓ tfidf_matrix.pkl loaded | Shape: {getattr(tfidf_matrix, 'shape', 'N/A')}")
 
-    # Load tfidf vectorizer
-    with open(TFIDF_PATH, "rb") as f:
-        tfidf_obj = pickle.load(f)
+        with open(TFIDF_PATH, "rb") as f:
+            tfidf_obj = pickle.load(f)
+        print("✓ tfidf.pkl loaded")
 
-    # Build map
-    TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
+        TITLE_TO_IDX = build_title_to_idx_map(indices_obj)
+        print(f"✓ Title to index map built | Size: {len(TITLE_TO_IDX)}")
 
-    # Validation
-    if df is None or "title" not in df.columns:
-        raise RuntimeError(
-            "df.pkl must contain 'title' column"
-        )
+        if df is None or "title" not in df.columns:
+            raise RuntimeError("df.pkl must contain 'title' column")
+
+        print("✅ All models loaded successfully!")
+
+    except Exception as e:
+        print(f"❌ Failed to load pickle files: {type(e).__name__}: {e}")
+        raise
 
 
 # =========================
@@ -312,104 +270,47 @@ def load_pickles():
 # =========================
 @app.get("/")
 def root():
-    return {
-        "message": "Movie Recommendation API Running"
-    }
+    return {"message": "Movie Recommendation API Running"}
 
 
 @app.get("/health")
 def health():
-    return {
-        "status": "ok"
-    }
+    return {"status": "ok"}
 
 
-# =========================
-# MOVIE DETAILS
-# =========================
-@app.get(
-    "/movie",
-    response_model=OMDBMovieDetail
-)
-async def get_movie(
-    title: str = Query(..., min_length=1)
-):
-
+@app.get("/movie", response_model=OMDBMovieDetail)
+async def get_movie(title: str = Query(..., min_length=1)):
     return await omdb_movie_details(title)
 
 
-# =========================
-# TF-IDF RECOMMENDATIONS
-# =========================
 @app.get("/recommend/tfidf")
 async def recommend_tfidf(
     title: str = Query(..., min_length=1),
     top_n: int = Query(10, ge=1, le=50),
 ):
-
-    recs = tfidf_recommend_titles(
-        title,
-        top_n=top_n
-    )
-
-    return [
-        {
-            "title": t,
-            "score": s
-        }
-        for t, s in recs
-    ]
+    recs = tfidf_recommend_titles(title, top_n=top_n)
+    return [{"title": t, "score": s} for t, s in recs]
 
 
-# =========================
-# COMPLETE SEARCH BUNDLE
-# =========================
-@app.get(
-    "/movie/search",
-    response_model=SearchBundleResponse
-)
+@app.get("/movie/search", response_model=SearchBundleResponse)
 async def search_bundle(
     query: str = Query(..., min_length=1),
     tfidf_top_n: int = Query(10, ge=1, le=30),
 ):
-
-    # Fetch movie details
     details = await omdb_movie_details(query)
 
-    # TF-IDF recommendations
-    tfidf_items: List[TFIDFRecItem] = []
-
-    recs: List[Tuple[str, float]] = []
-
     try:
-        recs = tfidf_recommend_titles(
-            details.title,
-            top_n=tfidf_top_n
-        )
-
+        recs = tfidf_recommend_titles(details.title, top_n=tfidf_top_n)
     except Exception:
-
         try:
-            recs = tfidf_recommend_titles(
-                query,
-                top_n=tfidf_top_n
-            )
-
+            recs = tfidf_recommend_titles(query, top_n=tfidf_top_n)
         except Exception:
             recs = []
 
-    # Attach OMDb posters/details
+    tfidf_items = []
     for title, score in recs:
-
         card = await attach_omdb_card_by_title(title)
-
-        tfidf_items.append(
-            TFIDFRecItem(
-                title=title,
-                score=score,
-                omdb=card
-            )
-        )
+        tfidf_items.append(TFIDFRecItem(title=title, score=score, omdb=card))
 
     return SearchBundleResponse(
         query=query,
